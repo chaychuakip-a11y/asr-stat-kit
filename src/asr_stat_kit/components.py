@@ -261,34 +261,112 @@ class ExcelExporter(BaseExporter):
         writer.close()
 
 class CorpusSearcher(BaseSearcher):
+    """Multi-threaded corpus searcher with detailed provenance."""
+    
     def __init__(self, corpus_dir: str):
         self.corpus_dir = corpus_dir
-        self.corpus_data: Set[str] = set()
+        # Store data as tuples: (lowercase_text, source_file, sheet_name, row, col)
+        self.corpus_entries: List[Tuple[str, str, str, int, int]] = []
         self._load_corpus_threaded()
 
     def _load_corpus_threaded(self):
-        print(f"Loading corpus from: {self.corpus_dir}")
-        files = []
+        print(f"Scanning corpus directory: {self.corpus_dir} ...")
+        
+        # 1. Discover all Excel files first
+        files_to_process = []
         for root, _, fs in os.walk(self.corpus_dir):
-            files.extend([os.path.join(root, f) for f in fs if f.endswith(('.xlsx', '.xls'))])
-        with ThreadPoolExecutor() as executor:
-            for f in as_completed({executor.submit(self._read_excel, f): f for f in files}):
-                self.corpus_data.update(f.result())
-        print(f"Corpus loaded: {len(self.corpus_data)} entries.")
+            for f in fs:
+                if f.endswith(('.xlsx', '.xls')):
+                    files_to_process.append(os.path.join(root, f))
+        
+        if not files_to_process:
+            print("No Excel files found in corpus directory.")
+            return
 
-    def _read_excel(self, filepath: str) -> List[str]:
+        print(f"Found {len(files_to_process)} corpus files. Loading in parallel...")
+        
+        # 2. Process files in parallel
+        # Adjust max_workers based on your CPU (usually os.cpu_count() * 5 for I/O bound tasks)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # Submit all file load tasks
+            future_to_file = {executor.submit(self._read_excel_file, f): f for f in files_to_process}
+            
+            for future in as_completed(future_to_file):
+                try:
+                    entries = future.result()
+                    self.corpus_entries.extend(entries)
+                except Exception as exc:
+                    print(f"Error loading {future_to_file[future]}: {exc}")
+                    
+        print(f"Corpus loaded: {len(self.corpus_entries)} total cells indexed.")
+
+    def _read_excel_file(self, filepath: str) -> List[Tuple[str, str, str, int, int]]:
+        """Worker function to read a single Excel file."""
+        local_entries = []
+        filename = os.path.basename(filepath)
+        
         try:
-            df = pd.read_excel(filepath, header=None)
-            return [str(x) for col in df.columns for x in df[col].dropna().tolist()]
-        except: return []
+            # Read all sheets
+            xls = pd.ExcelFile(filepath)
+            for sheet_name in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+                
+                # Iterate through dataframe
+                for r_idx, row in df.iterrows():
+                    for c_idx, val in enumerate(row):
+                        if pd.notna(val):
+                            text_str = str(val).strip()
+                            if text_str:
+                                # Store format: (lower_text, filename, sheet, row, col)
+                                local_entries.append((
+                                    text_str.lower(), 
+                                    filename, 
+                                    sheet_name, 
+                                    r_idx + 1, # 1-based index for humans
+                                    c_idx + 1
+                                ))
+        except Exception:
+            # Silently fail for individual bad files to keep pipeline running
+            return []
+            
+        return local_entries
 
     def search(self, input_path: str) -> pd.DataFrame:
-        with open(input_path, 'r', encoding='utf-8') as f: lines = [l.strip() for l in f if l.strip()]
+        print(f"Reading input file: {input_path}")
+        with open(input_path, 'r', encoding='utf-8') as f:
+            search_terms = [line.strip() for line in f if line.strip()]
+        
+        print(f"Searching {len(search_terms)} terms against {len(self.corpus_entries)} corpus entries...")
         results = []
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(self._process_chunk, lines[i:i+1000], i+1) for i in range(0, len(lines), 1000)]
-            for future in as_completed(futures): results.extend(future.result())
-        return pd.DataFrame(sorted(results, key=lambda x: x['line_num']))
 
-    def _process_chunk(self, lines: List[str], start_idx: int) -> List[Dict]:
-        return [{'line_num': start_idx+i, 'text': t, 'in_corpus': t in self.corpus_data} for i, t in enumerate(lines)]
+        # Optimization: Converting list to DataFrame once might be faster for very large datasets,
+        # but for substring search, iterating the list is often simpler unless we use vectorization.
+        # Given the requirement for "substring match", simple iteration is robust.
+        
+        for term in search_terms:
+            term_lower = term.lower()
+            found = False
+            
+            # Linear scan (Regex or 'in' check)
+            # For massive corpora, this part should ideally be inverted index, 
+            # but per instructions, we stick to substring logic.
+            for entry_text, fname, sheet, row, col in self.corpus_entries:
+                if term_lower in entry_text:
+                    results.append({
+                        'search_term': term,
+                        'status': 'FOUND',
+                        'corpus_file': fname,
+                        'sheet': sheet,
+                        'location': f"R{row}:C{col}",
+                        'matched_content': entry_text  # Original text not stored to save RAM, using lower
+                    })
+                    found = True
+            
+            if not found:
+                 results.append({
+                    'search_term': term,
+                    'status': 'NOT FOUND',
+                    'corpus_file': '', 'sheet': '', 'location': '', 'matched_content': ''
+                })
+
+        return pd.DataFrame(results)
