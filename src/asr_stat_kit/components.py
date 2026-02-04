@@ -77,21 +77,38 @@ class StatsProcessor(BaseProcessor):
         self.regex = regex
 
     def process(self, pending_df: pd.DataFrame, online_df: pd.DataFrame) -> pd.DataFrame:
+        # 1. Prepare Merge Keys
         pending_df['merge_key'] = self._get_merge_key(pending_df[self.config.col_filename])
         online_df['merge_key'] = self._get_merge_key(online_df[self.config.col_filename])
         online_clean = online_df.drop_duplicates(subset=['merge_key'])
         
+        # 2. Select Columns
         cols_needed = [self.config.col_filename, 'merge_key', self.config.col_sent_rate, self.config.col_word_rate, self.config.col_weight]
+        # Filter strictly for columns that exist
         p_cols = [c for c in cols_needed if c in pending_df.columns]
         o_cols = [c for c in cols_needed if c != self.config.col_filename and c in online_clean.columns]
 
-        df_merged = pd.merge(pending_df[p_cols], online_clean[o_cols], on='merge_key', suffixes=('_pending', '_online'), how='inner')
-        for col in [f"{c}_{s}" for c in [self.config.col_sent_rate, self.config.col_word_rate, self.config.col_weight] for s in ['pending', 'online']]:
-            if col in df_merged.columns: df_merged[col] = df_merged[col].fillna(0)
+        # 3. Merge
+        # This will create columns like: sent_pending, sent_online, sent_num_pending, sent_num_online
+        df_merged = pd.merge(
+            pending_df[p_cols], 
+            online_clean[o_cols], 
+            on='merge_key', 
+            suffixes=('_pending', '_online'), 
+            how='inner'
+        )
 
+        # 4. Fill NaNs
+        numeric_targets = [f"{c}_{s}" for c in [self.config.col_sent_rate, self.config.col_word_rate, self.config.col_weight] for s in ['pending', 'online']]
+        for col in numeric_targets:
+            if col in df_merged.columns: 
+                df_merged[col] = df_merged[col].fillna(0)
+
+        # 5. Extract Groups & Calculate Row Diffs
         df_merged[self.config.col_task_group] = df_merged[self.config.col_filename].apply(self._extract_task_group)
         df_merged[self.config.out_sent_diff] = df_merged[self.config.out_sent_pending] - df_merged[self.config.out_sent_online]
         df_merged[self.config.out_word_diff] = df_merged[self.config.out_word_pending] - df_merged[self.config.out_word_online]
+        
         return self._reorder_with_group_stats(df_merged)
 
     def _get_merge_key(self, series: pd.Series) -> pd.Series:
@@ -108,38 +125,90 @@ class StatsProcessor(BaseProcessor):
         total_weight = weights.sum()
         return (rates * weights).sum() / total_weight if total_weight != 0 else 0.0
 
+    def _get_weight_col(self, metric_name: str) -> str:
+        """Determines the correct weight column name based on the metric suffix."""
+        # Metric is usually like 'sent_pending' or 'word_online'
+        # Weight name is usually 'sent_num'
+        # Result should be 'sent_num_pending' or 'sent_num_online'
+        
+        if metric_name.endswith('_pending'):
+            return f"{self.config.col_weight}_pending"
+        elif metric_name.endswith('_online'):
+            return f"{self.config.col_weight}_online"
+        else:
+            raise ValueError(f"Unknown metric suffix: {metric_name}")
+
     def _reorder_with_group_stats(self, df: pd.DataFrame) -> pd.DataFrame:
         final_rows = []
         groups = sorted(df[self.config.col_task_group].unique())
+        
+        # Define the 4 main metrics we calculate averages for
+        metrics_to_calc = [
+            self.config.out_sent_pending, 
+            self.config.out_sent_online, 
+            self.config.out_word_pending, 
+            self.config.out_word_online
+        ]
+
         for group in groups:
             group_df = df[df[self.config.col_task_group] == group].sort_values(by=self.config.col_filename)
             if group_df.empty: continue
             
+            # --- Calculate Group Average ---
             avg_row = {
                 self.config.col_filename: f"Average ({group})",
-                self.config.col_task_group: group, 'is_group_avg': True
+                self.config.col_task_group: group, 
+                'is_group_avg': True
             }
-            for metric in [self.config.out_sent_pending, self.config.out_sent_online, self.config.out_word_pending, self.config.out_word_online]:
-                weight_col = metric.replace('sent', 'sent_num').replace('word', 'sent_num').replace('_pending', f'_{self.config.col_weight}_pending').replace('_online', f'_{self.config.col_weight}_online')
-                avg_row[metric] = self._calculate_weighted_avg(group_df[metric], group_df[weight_col])
             
+            for metric in metrics_to_calc:
+                weight_col = self._get_weight_col(metric)
+                # Safely get series (handle edge case where column might be missing)
+                rates = group_df[metric] if metric in group_df else pd.Series(0, index=group_df.index)
+                weights = group_df[weight_col] if weight_col in group_df else pd.Series(0, index=group_df.index)
+                
+                avg_row[metric] = self._calculate_weighted_avg(rates, weights)
+            
+            # Calculate Diff for Average Row
             avg_row[self.config.out_sent_diff] = avg_row[self.config.out_sent_pending] - avg_row[self.config.out_sent_online]
             avg_row[self.config.out_word_diff] = avg_row[self.config.out_word_pending] - avg_row[self.config.out_word_online]
+            
             final_rows.append(pd.DataFrame([avg_row]))
             final_rows.append(group_df)
 
-        total_row = {self.config.col_filename: 'Total', self.config.col_task_group: 'ZZZ_Total', 'is_total': True}
-        for metric in [self.config.out_sent_pending, self.config.out_sent_online, self.config.out_word_pending, self.config.out_word_online]:
-            weight_col = metric.replace('sent', 'sent_num').replace('word', 'sent_num').replace('_pending', f'_{self.config.col_weight}_pending').replace('_online', f'_{self.config.col_weight}_online')
-            total_row[metric] = self._calculate_weighted_avg(df[metric], df[weight_col])
+        # --- Calculate Grand Total ---
+        total_row = {
+            self.config.col_filename: 'Total', 
+            self.config.col_task_group: 'ZZZ_Total', 
+            'is_total': True
+        }
+        
+        for metric in metrics_to_calc:
+            weight_col = self._get_weight_col(metric)
+            rates = df[metric] if metric in df else pd.Series(0, index=df.index)
+            weights = df[weight_col] if weight_col in df else pd.Series(0, index=df.index)
+            
+            total_row[metric] = self._calculate_weighted_avg(rates, weights)
+
         total_row[self.config.out_sent_diff] = total_row[self.config.out_sent_pending] - total_row[self.config.out_sent_online]
         total_row[self.config.out_word_diff] = total_row[self.config.out_word_pending] - total_row[self.config.out_word_online]
+        
         final_rows.append(pd.DataFrame([total_row]))
         
+        # --- Final Concatenation ---
         df_final = pd.concat(final_rows, ignore_index=True)
-        cols = [self.config.col_filename, self.config.out_sent_online, self.config.out_word_online, self.config.out_sent_pending, self.config.out_word_pending, self.config.out_sent_diff, self.config.out_word_diff]
+        
+        # Columns to keep
+        cols = [
+            self.config.col_filename, 
+            self.config.out_sent_online, self.config.out_word_online, 
+            self.config.out_sent_pending, self.config.out_word_pending, 
+            self.config.out_sent_diff, self.config.out_word_diff
+        ]
+        # Preserve metadata flags for styling
         for mc in ['is_group_avg', 'is_total']:
             if mc in df_final.columns: cols.append(mc)
+            
         return df_final[cols].fillna(0)
 
 class ExcelExporter(BaseExporter):
