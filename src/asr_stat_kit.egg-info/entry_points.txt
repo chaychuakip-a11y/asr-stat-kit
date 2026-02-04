@@ -1,0 +1,2 @@
+[console_scripts]
+asr-kit = asr_stat_kit.cli:main

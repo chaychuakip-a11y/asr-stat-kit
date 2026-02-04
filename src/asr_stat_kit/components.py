@@ -1,0 +1,225 @@
+import os
+import glob
+import zipfile
+import re
+import pandas as pd
+import xlsxwriter
+from typing import Tuple, List, Set, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Relative imports for package structure
+from .interfaces import BaseLoader, BaseProcessor, BaseExporter, BaseSearcher
+from .config import ColumnMapping, StyleConfig, RegexConfig
+
+class ZipDataLoader(BaseLoader):
+    def __init__(self, config: ColumnMapping = ColumnMapping(), regex: RegexConfig = RegexConfig()):
+        self.config = config
+        self.regex = regex
+
+    def discover(self, directory: str = '.') -> Tuple[str, str]:
+        zip_files = glob.glob(os.path.join(directory, "*.zip"))
+        zip_files.sort(key=os.path.getmtime, reverse=True)
+        if len(zip_files) < 2:
+            raise FileNotFoundError("Error: Less than 2 zip files found in the directory.")
+        return zip_files[0], zip_files[1]
+
+    def load(self, zip_path: str) -> pd.DataFrame:
+        target_filename = 'all_result.csv'
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            candidates = [n for n in z.namelist() if n.endswith(target_filename)]
+            if not candidates:
+                raise FileNotFoundError(f"File {target_filename} not found in {zip_path}")
+            with z.open(candidates[0]) as f:
+                try:
+                    df = pd.read_csv(f, sep='\t', dtype={self.config.col_filename: str}, index_col=False)
+                    if len(df.columns) < 2: raise ValueError
+                except:
+                    f.seek(0)
+                    df = pd.read_csv(f, sep=None, engine='python', dtype={self.config.col_filename: str}, index_col=False)
+        
+        df.columns = df.columns.str.strip()
+        df = self._standardize_columns(df)
+        return self._clean_data(df)
+
+    def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        if self.config.col_filename not in df.columns:
+            for col in df.columns:
+                if any(c in str(col).lower() for c in self.config.filename_candidates):
+                    first_val = str(df[col].iloc[0]) if not df.empty else ""
+                    if not re.match(r'^[\d\.]+$', first_val):
+                        df.rename(columns={col: self.config.col_filename}, inplace=True)
+                        break
+            if self.config.col_filename not in df.columns:
+                df.rename(columns={df.columns[0]: self.config.col_filename}, inplace=True)
+
+        if self.config.col_weight not in df.columns:
+            for col in df.columns:
+                if any(c in str(col).lower() for c in self.config.weight_candidates):
+                    df.rename(columns={col: self.config.col_weight}, inplace=True)
+                    break
+        if self.config.col_weight not in df.columns:
+            df[self.config.col_weight] = 1
+        return df
+
+    def _clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.dropna(subset=[self.config.col_filename])
+        df[self.config.col_filename] = df[self.config.col_filename].astype(str).str.strip()
+        df = df[~df[self.config.col_filename].str.match(self.regex.numeric_only, na=False)]
+        for col in [self.config.col_sent_rate, self.config.col_word_rate, self.config.col_weight]:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.replace('%', '', regex=False)
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        return df[df[self.config.col_filename].str.lower() != 'avg']
+
+class StatsProcessor(BaseProcessor):
+    def __init__(self, config: ColumnMapping = ColumnMapping(), regex: RegexConfig = RegexConfig()):
+        self.config = config
+        self.regex = regex
+
+    def process(self, pending_df: pd.DataFrame, online_df: pd.DataFrame) -> pd.DataFrame:
+        pending_df['merge_key'] = self._get_merge_key(pending_df[self.config.col_filename])
+        online_df['merge_key'] = self._get_merge_key(online_df[self.config.col_filename])
+        online_clean = online_df.drop_duplicates(subset=['merge_key'])
+        
+        cols_needed = [self.config.col_filename, 'merge_key', self.config.col_sent_rate, self.config.col_word_rate, self.config.col_weight]
+        p_cols = [c for c in cols_needed if c in pending_df.columns]
+        o_cols = [c for c in cols_needed if c != self.config.col_filename and c in online_clean.columns]
+
+        df_merged = pd.merge(pending_df[p_cols], online_clean[o_cols], on='merge_key', suffixes=('_pending', '_online'), how='inner')
+        for col in [f"{c}_{s}" for c in [self.config.col_sent_rate, self.config.col_word_rate, self.config.col_weight] for s in ['pending', 'online']]:
+            if col in df_merged.columns: df_merged[col] = df_merged[col].fillna(0)
+
+        df_merged[self.config.col_task_group] = df_merged[self.config.col_filename].apply(self._extract_task_group)
+        df_merged[self.config.out_sent_diff] = df_merged[self.config.out_sent_pending] - df_merged[self.config.out_sent_online]
+        df_merged[self.config.out_word_diff] = df_merged[self.config.out_word_pending] - df_merged[self.config.out_word_online]
+        return self._reorder_with_group_stats(df_merged)
+
+    def _get_merge_key(self, series: pd.Series) -> pd.Series:
+        s = series.astype(str).str.lower().str.strip()
+        for p, r in [(self.regex.clean_filename, ''), (self.regex.clean_whitespace, '_'), (self.regex.clean_numeric_suffix, '')]:
+            s = s.str.replace(p, r, regex=True)
+        return s
+
+    def _extract_task_group(self, filename: str) -> str:
+        match = re.search(self.regex.task_group_extraction, filename)
+        return match.group(1) if match else "Other"
+
+    def _calculate_weighted_avg(self, rates: pd.Series, weights: pd.Series) -> float:
+        total_weight = weights.sum()
+        return (rates * weights).sum() / total_weight if total_weight != 0 else 0.0
+
+    def _reorder_with_group_stats(self, df: pd.DataFrame) -> pd.DataFrame:
+        final_rows = []
+        groups = sorted(df[self.config.col_task_group].unique())
+        for group in groups:
+            group_df = df[df[self.config.col_task_group] == group].sort_values(by=self.config.col_filename)
+            if group_df.empty: continue
+            
+            avg_row = {
+                self.config.col_filename: f"Average ({group})",
+                self.config.col_task_group: group, 'is_group_avg': True
+            }
+            for metric in [self.config.out_sent_pending, self.config.out_sent_online, self.config.out_word_pending, self.config.out_word_online]:
+                weight_col = metric.replace('sent', 'sent_num').replace('word', 'sent_num').replace('_pending', f'_{self.config.col_weight}_pending').replace('_online', f'_{self.config.col_weight}_online')
+                avg_row[metric] = self._calculate_weighted_avg(group_df[metric], group_df[weight_col])
+            
+            avg_row[self.config.out_sent_diff] = avg_row[self.config.out_sent_pending] - avg_row[self.config.out_sent_online]
+            avg_row[self.config.out_word_diff] = avg_row[self.config.out_word_pending] - avg_row[self.config.out_word_online]
+            final_rows.append(pd.DataFrame([avg_row]))
+            final_rows.append(group_df)
+
+        total_row = {self.config.col_filename: 'Total', self.config.col_task_group: 'ZZZ_Total', 'is_total': True}
+        for metric in [self.config.out_sent_pending, self.config.out_sent_online, self.config.out_word_pending, self.config.out_word_online]:
+            weight_col = metric.replace('sent', 'sent_num').replace('word', 'sent_num').replace('_pending', f'_{self.config.col_weight}_pending').replace('_online', f'_{self.config.col_weight}_online')
+            total_row[metric] = self._calculate_weighted_avg(df[metric], df[weight_col])
+        total_row[self.config.out_sent_diff] = total_row[self.config.out_sent_pending] - total_row[self.config.out_sent_online]
+        total_row[self.config.out_word_diff] = total_row[self.config.out_word_pending] - total_row[self.config.out_word_online]
+        final_rows.append(pd.DataFrame([total_row]))
+        
+        df_final = pd.concat(final_rows, ignore_index=True)
+        cols = [self.config.col_filename, self.config.out_sent_online, self.config.out_word_online, self.config.out_sent_pending, self.config.out_word_pending, self.config.out_sent_diff, self.config.out_word_diff]
+        for mc in ['is_group_avg', 'is_total']:
+            if mc in df_final.columns: cols.append(mc)
+        return df_final[cols].fillna(0)
+
+class ExcelExporter(BaseExporter):
+    def __init__(self, style_config: StyleConfig = StyleConfig()):
+        self.style = style_config
+
+    def export(self, df: pd.DataFrame, output_path: str) -> None:
+        print(f"Generating report: {output_path}")
+        writer = pd.ExcelWriter(output_path, engine='xlsxwriter')
+        export_cols = [c for c in df.columns if c not in ['is_group_avg', 'is_total']]
+        df[export_cols].to_excel(writer, sheet_name='Comparison', index=False, header=False, startrow=2)
+        workbook, worksheet = writer.book, writer.sheets['Comparison']
+        
+        fmt_header = workbook.add_format({'bold': True, 'font_color': self.style.color_header_font, 'bg_color': self.style.color_header_bg, 'border': 1, 'align': 'center'})
+        fmt_sub = workbook.add_format({'bold': True, 'font_color': self.style.color_subheader_font, 'bg_color': self.style.color_subheader_bg, 'border': 1, 'align': 'center'})
+        worksheet.merge_range(0, 0, 1, 0, "Test Set", fmt_header)
+        worksheet.merge_range(0, 1, 0, 2, "Online", fmt_header)
+        worksheet.write(1, 1, "Sent Acc", fmt_sub); worksheet.write(1, 2, "Word Acc", fmt_sub)
+        worksheet.merge_range(0, 3, 0, 4, "Pending", fmt_header)
+        worksheet.write(1, 3, "Sent Acc", fmt_sub); worksheet.write(1, 4, "Word Acc", fmt_sub)
+        worksheet.merge_range(0, 5, 0, 6, "Diff", fmt_header)
+        worksheet.write(1, 5, "Sent Acc", fmt_sub); worksheet.write(1, 6, "Word Acc", fmt_sub)
+        
+        worksheet.set_column(0, 0, 45); worksheet.set_column(1, 6, 12)
+        diff_indices = [5, 6]
+        
+        for r_idx in range(len(df)):
+            row_num = r_idx + 2
+            row_data = df.iloc[r_idx]
+            is_total, is_avg = row_data.get('is_total', False), row_data.get('is_group_avg', False)
+            
+            lbl_fmt = workbook.add_format({'border': 1, 'align': 'left'})
+            if is_total: lbl_fmt.set_bg_color(self.style.color_total_bg); lbl_fmt.set_bold()
+            elif is_avg: lbl_fmt.set_bg_color(self.style.color_group_avg_bg); lbl_fmt.set_bold()
+            worksheet.write(row_num, 0, row_data[export_cols[0]], lbl_fmt)
+            
+            for c_idx in range(1, len(export_cols)):
+                val = row_data[export_cols[c_idx]]
+                base_fmt = workbook.add_format({'border': 1, 'num_format': '0.00', 'align': 'center'})
+                if is_total: base_fmt.set_bg_color(self.style.color_total_bg); base_fmt.set_bold()
+                elif is_avg: base_fmt.set_bg_color(self.style.color_group_avg_bg); base_fmt.set_bold()
+                
+                if c_idx in diff_indices and not is_total:
+                    if val > self.style.threshold_positive: base_fmt.set_font_color(self.style.color_green_text); 
+                    elif val < self.style.threshold_negative: base_fmt.set_font_color(self.style.color_red_text)
+                    if not is_avg: base_fmt.set_bg_color(self.style.color_green_bg if val > self.style.threshold_positive else self.style.color_red_bg if val < self.style.threshold_negative else 'white')
+                
+                worksheet.write(row_num, c_idx, val, base_fmt)
+        worksheet.freeze_panes(2, 1)
+        writer.close()
+
+class CorpusSearcher(BaseSearcher):
+    def __init__(self, corpus_dir: str):
+        self.corpus_dir = corpus_dir
+        self.corpus_data: Set[str] = set()
+        self._load_corpus_threaded()
+
+    def _load_corpus_threaded(self):
+        print(f"Loading corpus from: {self.corpus_dir}")
+        files = []
+        for root, _, fs in os.walk(self.corpus_dir):
+            files.extend([os.path.join(root, f) for f in fs if f.endswith(('.xlsx', '.xls'))])
+        with ThreadPoolExecutor() as executor:
+            for f in as_completed({executor.submit(self._read_excel, f): f for f in files}):
+                self.corpus_data.update(f.result())
+        print(f"Corpus loaded: {len(self.corpus_data)} entries.")
+
+    def _read_excel(self, filepath: str) -> List[str]:
+        try:
+            df = pd.read_excel(filepath, header=None)
+            return [str(x) for col in df.columns for x in df[col].dropna().tolist()]
+        except: return []
+
+    def search(self, input_path: str) -> pd.DataFrame:
+        with open(input_path, 'r', encoding='utf-8') as f: lines = [l.strip() for l in f if l.strip()]
+        results = []
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(self._process_chunk, lines[i:i+1000], i+1) for i in range(0, len(lines), 1000)]
+            for future in as_completed(futures): results.extend(future.result())
+        return pd.DataFrame(sorted(results, key=lambda x: x['line_num']))
+
+    def _process_chunk(self, lines: List[str], start_idx: int) -> List[Dict]:
+        return [{'line_num': start_idx+i, 'text': t, 'in_corpus': t in self.corpus_data} for i, t in enumerate(lines)]

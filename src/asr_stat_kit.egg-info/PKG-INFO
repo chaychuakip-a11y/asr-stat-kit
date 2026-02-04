@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: asr-stat-kit
+Version: 1.0.0
+Summary: Automated ASR Version Comparison and Statistical Reporting Tool
+Author-email: ASR Team <dev@example.com>
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+Requires-Dist: pandas>=1.3.0
+Requires-Dist: numpy>=1.21.0
+Requires-Dist: xlsxwriter>=3.0.0
+Requires-Dist: argcomplete>=2.0.0
+Requires-Dist: openpyxl>=3.0.0
