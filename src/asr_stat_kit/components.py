@@ -4,7 +4,7 @@ import zipfile
 import re
 import pandas as pd
 import xlsxwriter
-from typing import Tuple, List, Set, Dict
+from typing import Tuple, List, Set, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Relative imports for package structure
@@ -12,6 +12,8 @@ from .interfaces import BaseLoader, BaseProcessor, BaseExporter, BaseSearcher
 from .config import ColumnMapping, StyleConfig, RegexConfig
 
 class ZipDataLoader(BaseLoader):
+    """Handles discovering and robust parsing of CSV/TSV data from Zip archives."""
+    
     def __init__(self, config: ColumnMapping = ColumnMapping(), regex: RegexConfig = RegexConfig()):
         self.config = config
         self.regex = regex
@@ -29,17 +31,51 @@ class ZipDataLoader(BaseLoader):
             candidates = [n for n in z.namelist() if n.endswith(target_filename)]
             if not candidates:
                 raise FileNotFoundError(f"File {target_filename} not found in {zip_path}")
+            
             with z.open(candidates[0]) as f:
-                try:
-                    df = pd.read_csv(f, sep='\t', dtype={self.config.col_filename: str}, index_col=False)
-                    if len(df.columns) < 2: raise ValueError
-                except:
-                    f.seek(0)
-                    df = pd.read_csv(f, sep=None, engine='python', dtype={self.config.col_filename: str}, index_col=False)
+                df = self._read_csv_robust(f)
         
         df.columns = df.columns.str.strip()
         df = self._standardize_columns(df)
         return self._clean_data(df)
+
+    def _read_csv_robust(self, file_handle) -> pd.DataFrame:
+        """
+        Attempts to read CSV with multiple strategies (Encoding + Separator).
+        Fixes UnicodeDecodeError on GBK/GB18030 files.
+        """
+        # Strategy: (Separator, Engine, Encoding)
+        strategies = [
+            ('\t', 'c', 'utf-8'),       # Standard Linux/Mac
+            ('\t', 'c', 'gb18030'),     # Standard Chinese Windows
+            (None, 'python', 'utf-8'),  # Auto-detect sep (slower)
+            (None, 'python', 'gb18030') # Auto-detect sep + Chinese
+        ]
+        
+        last_error = None
+        
+        for sep, engine, encoding in strategies:
+            file_handle.seek(0) # Reset stream pointer
+            try:
+                kw = {
+                    'sep': sep,
+                    'dtype': {self.config.col_filename: str},
+                    'index_col': False,
+                    'encoding': encoding
+                }
+                if engine == 'python':
+                    kw['engine'] = 'python'
+                
+                df = pd.read_csv(file_handle, **kw)
+                
+                # Basic validation: Must have at least 2 columns to be valid
+                if len(df.columns) >= 2:
+                    return df
+            except Exception as e:
+                last_error = e
+                continue
+                
+        raise ValueError(f"Failed to read CSV with UTF-8 or GB18030. Last error: {last_error}")
 
     def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         if self.config.col_filename not in df.columns:
@@ -84,12 +120,10 @@ class StatsProcessor(BaseProcessor):
         
         # 2. Select Columns
         cols_needed = [self.config.col_filename, 'merge_key', self.config.col_sent_rate, self.config.col_word_rate, self.config.col_weight]
-        # Filter strictly for columns that exist
         p_cols = [c for c in cols_needed if c in pending_df.columns]
         o_cols = [c for c in cols_needed if c != self.config.col_filename and c in online_clean.columns]
 
         # 3. Merge
-        # This will create columns like: sent_pending, sent_online, sent_num_pending, sent_num_online
         df_merged = pd.merge(
             pending_df[p_cols], 
             online_clean[o_cols], 
@@ -126,11 +160,6 @@ class StatsProcessor(BaseProcessor):
         return (rates * weights).sum() / total_weight if total_weight != 0 else 0.0
 
     def _get_weight_col(self, metric_name: str) -> str:
-        """Determines the correct weight column name based on the metric suffix."""
-        # Metric is usually like 'sent_pending' or 'word_online'
-        # Weight name is usually 'sent_num'
-        # Result should be 'sent_num_pending' or 'sent_num_online'
-        
         if metric_name.endswith('_pending'):
             return f"{self.config.col_weight}_pending"
         elif metric_name.endswith('_online'):
@@ -142,7 +171,6 @@ class StatsProcessor(BaseProcessor):
         final_rows = []
         groups = sorted(df[self.config.col_task_group].unique())
         
-        # Define the 4 main metrics we calculate averages for
         metrics_to_calc = [
             self.config.out_sent_pending, 
             self.config.out_sent_online, 
@@ -154,7 +182,6 @@ class StatsProcessor(BaseProcessor):
             group_df = df[df[self.config.col_task_group] == group].sort_values(by=self.config.col_filename)
             if group_df.empty: continue
             
-            # --- Calculate Group Average ---
             avg_row = {
                 self.config.col_filename: f"Average ({group})",
                 self.config.col_task_group: group, 
@@ -163,20 +190,16 @@ class StatsProcessor(BaseProcessor):
             
             for metric in metrics_to_calc:
                 weight_col = self._get_weight_col(metric)
-                # Safely get series (handle edge case where column might be missing)
                 rates = group_df[metric] if metric in group_df else pd.Series(0, index=group_df.index)
                 weights = group_df[weight_col] if weight_col in group_df else pd.Series(0, index=group_df.index)
-                
                 avg_row[metric] = self._calculate_weighted_avg(rates, weights)
             
-            # Calculate Diff for Average Row
             avg_row[self.config.out_sent_diff] = avg_row[self.config.out_sent_pending] - avg_row[self.config.out_sent_online]
             avg_row[self.config.out_word_diff] = avg_row[self.config.out_word_pending] - avg_row[self.config.out_word_online]
             
             final_rows.append(pd.DataFrame([avg_row]))
             final_rows.append(group_df)
 
-        # --- Calculate Grand Total ---
         total_row = {
             self.config.col_filename: 'Total', 
             self.config.col_task_group: 'ZZZ_Total', 
@@ -187,7 +210,6 @@ class StatsProcessor(BaseProcessor):
             weight_col = self._get_weight_col(metric)
             rates = df[metric] if metric in df else pd.Series(0, index=df.index)
             weights = df[weight_col] if weight_col in df else pd.Series(0, index=df.index)
-            
             total_row[metric] = self._calculate_weighted_avg(rates, weights)
 
         total_row[self.config.out_sent_diff] = total_row[self.config.out_sent_pending] - total_row[self.config.out_sent_online]
@@ -195,17 +217,13 @@ class StatsProcessor(BaseProcessor):
         
         final_rows.append(pd.DataFrame([total_row]))
         
-        # --- Final Concatenation ---
         df_final = pd.concat(final_rows, ignore_index=True)
-        
-        # Columns to keep
         cols = [
             self.config.col_filename, 
             self.config.out_sent_online, self.config.out_word_online, 
             self.config.out_sent_pending, self.config.out_word_pending, 
             self.config.out_sent_diff, self.config.out_word_diff
         ]
-        # Preserve metadata flags for styling
         for mc in ['is_group_avg', 'is_total']:
             if mc in df_final.columns: cols.append(mc)
             
@@ -272,7 +290,6 @@ class CorpusSearcher(BaseSearcher):
     def _load_corpus_threaded(self):
         print(f"Scanning corpus directory: {self.corpus_dir} ...")
         
-        # 1. Discover all Excel files first
         files_to_process = []
         for root, _, fs in os.walk(self.corpus_dir):
             for f in fs:
@@ -285,10 +302,7 @@ class CorpusSearcher(BaseSearcher):
 
         print(f"Found {len(files_to_process)} corpus files. Loading in parallel...")
         
-        # 2. Process files in parallel
-        # Adjust max_workers based on your CPU (usually os.cpu_count() * 5 for I/O bound tasks)
         with ThreadPoolExecutor(max_workers=10) as executor:
-            # Submit all file load tasks
             future_to_file = {executor.submit(self._read_excel_file, f): f for f in files_to_process}
             
             for future in as_completed(future_to_file):
@@ -301,32 +315,26 @@ class CorpusSearcher(BaseSearcher):
         print(f"Corpus loaded: {len(self.corpus_entries)} total cells indexed.")
 
     def _read_excel_file(self, filepath: str) -> List[Tuple[str, str, str, int, int]]:
-        """Worker function to read a single Excel file."""
         local_entries = []
         filename = os.path.basename(filepath)
         
         try:
-            # Read all sheets
             xls = pd.ExcelFile(filepath)
             for sheet_name in xls.sheet_names:
                 df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-                
-                # Iterate through dataframe
                 for r_idx, row in df.iterrows():
                     for c_idx, val in enumerate(row):
                         if pd.notna(val):
                             text_str = str(val).strip()
                             if text_str:
-                                # Store format: (lower_text, filename, sheet, row, col)
                                 local_entries.append((
                                     text_str.lower(), 
                                     filename, 
                                     sheet_name, 
-                                    r_idx + 1, # 1-based index for humans
+                                    r_idx + 1, 
                                     c_idx + 1
                                 ))
         except Exception:
-            # Silently fail for individual bad files to keep pipeline running
             return []
             
         return local_entries
@@ -338,18 +346,11 @@ class CorpusSearcher(BaseSearcher):
         
         print(f"Searching {len(search_terms)} terms against {len(self.corpus_entries)} corpus entries...")
         results = []
-
-        # Optimization: Converting list to DataFrame once might be faster for very large datasets,
-        # but for substring search, iterating the list is often simpler unless we use vectorization.
-        # Given the requirement for "substring match", simple iteration is robust.
         
         for term in search_terms:
             term_lower = term.lower()
             found = False
             
-            # Linear scan (Regex or 'in' check)
-            # For massive corpora, this part should ideally be inverted index, 
-            # but per instructions, we stick to substring logic.
             for entry_text, fname, sheet, row, col in self.corpus_entries:
                 if term_lower in entry_text:
                     results.append({
@@ -358,7 +359,7 @@ class CorpusSearcher(BaseSearcher):
                         'corpus_file': fname,
                         'sheet': sheet,
                         'location': f"R{row}:C{col}",
-                        'matched_content': entry_text  # Original text not stored to save RAM, using lower
+                        'matched_content': entry_text
                     })
                     found = True
             
